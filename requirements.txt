@@ -1,6 +1,4 @@
 flask==2.3.3
-numpy>=1.22.0  # This newer version works with Python 3.11
-pandas==2.0.3
 geopy==2.4.1
 folium==0.14.0
 python-dotenv==1.0.0

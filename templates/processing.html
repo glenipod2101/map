@@ -1,0 +1,86 @@
+<!-- templates/processing.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Processing - CSV Map Generator</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css">
+    <style>
+        body {
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+        }
+        .progress {
+            height: 25px;
+        }
+        #status-message {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Processing Your Data</h1>
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title">Geocoding and Map Generation in Progress</h5>
+                <p>We're processing your data. This may take several minutes for large files. Please don't close this window.</p>
+                
+                <div class="progress mt-4">
+                    <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
+                </div>
+                
+                <div id="status-message" class="alert alert-info">
+                    Geocoding addresses...
+                </div>
+                
+                <div id="complete-actions" style="display: none;" class="mt-3">
+                    <a id="view-results-btn" href="#" class="btn btn-primary">View Results</a>
+                    <a href="/" class="btn btn-secondary ms-2">Upload Another File</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Get job ID from the server
+        const jobId = "{{ job_id }}";
+        let checkInterval;
+        
+        // Function to check job status
+        function checkStatus() {
+            fetch(`/job-status/${jobId}`)
+                .then(response => response.json())
+                .then(data => {
+                    // Update progress bar
+                    const progressBar = document.getElementById('progress-bar');
+                    progressBar.style.width = `${data.progress}%`;
+                    progressBar.innerText = `${data.progress}%`;
+                    
+                    // Check status
+                    if (data.status === 'complete') {
+                        clearInterval(checkInterval);
+                        document.getElementById('status-message').className = 'alert alert-success';
+                        document.getElementById('status-message').innerText = 'Processing complete! Your map is ready.';
+                        document.getElementById('complete-actions').style.display = 'block';
+                        document.getElementById('view-results-btn').href = `/result/${jobId}`;
+                    } else if (data.status === 'error') {
+                        clearInterval(checkInterval);
+                        document.getElementById('status-message').className = 'alert alert-danger';
+                        document.getElementById('status-message').innerText = `Error: ${data.error || 'An unknown error occurred'}`;
+                    } else {
+                        document.getElementById('status-message').innerText = `Geocoding addresses... (${data.progress}% complete)`;
+                    }
+                })
+                .catch(error => {
+                    console.error('Error checking status:', error);
+                });
+        }
+        
+        // Check status immediately and then every 3 seconds
+        checkStatus();
+        checkInterval = setInterval(checkStatus, 3000);
+    </script>
+</body>
+</html>

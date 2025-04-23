@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory
-import pandas as pd
+import csv
+import io
 from geopy.geocoders import GoogleV3
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 import time
@@ -7,12 +8,10 @@ import folium
 from folium.plugins import MarkerCluster
 import os
 import uuid
-
 from dotenv import load_dotenv
 
-
+# Load environment variables from .env file
 load_dotenv()
-
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -24,21 +23,14 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['MAP_FOLDER'], exist_ok=True) 
 os.makedirs(app.config['GEOCODED_FOLDER'], exist_ok=True)
 
-# Your Google Maps API key
+# Get API key from environment variable
 GM_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY')
+if not GM_API_KEY:
+    print("WARNING: Google Maps API key not found in environment variables!")
 
 @app.route('/')
 def index():
     return render_template('index.html')
-
-@app.route('/download/map/<filename>')
-def download_map(filename):
-    response = send_from_directory(app.config['MAP_FOLDER'], filename, as_attachment=True)
-    # Set headers to force download
-    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
-    response.headers["Content-Type"] = "text/html"
-    return response
-
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -56,8 +48,13 @@ def upload_file():
     
     # Read the CSV to get column names
     try:
-        df = pd.read_csv(file_path)
-        columns = df.columns.tolist()
+        columns = []
+        with open(file_path, 'r', newline='', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            # First row contains headers
+            headers = next(reader)
+            columns = headers
+            
         return render_template('select_columns.html', 
                                columns=columns, 
                                file_path=file_path)
@@ -85,6 +82,14 @@ def process_file():
 @app.route('/maps/<filename>')
 def get_map(filename):
     return send_from_directory(app.config['MAP_FOLDER'], filename)
+
+@app.route('/download/map/<filename>')
+def download_map(filename):
+    response = send_from_directory(app.config['MAP_FOLDER'], filename, as_attachment=True)
+    # Set headers to force download
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    response.headers["Content-Type"] = "text/html"
+    return response
 
 @app.route('/geocoded/<filename>')
 def download_geocoded(filename):
@@ -115,81 +120,114 @@ def get_lat_long(address, retries=3):
                 return None
 
 def create_map(file_path, origin_column, destination_column, geocoded_path, map_path):
-    """Create a map from the CSV file"""
+    """Create a map from the CSV file without using pandas"""
     # Read the CSV file
-    df = pd.read_csv(file_path)
-    print(f"Successfully loaded CSV with {len(df)} rows")
+    data = []
+    headers = []
     
-    # Verify the columns exist
-    if origin_column not in df.columns:
-        raise ValueError(f"Column '{origin_column}' not found in CSV")
+    with open(file_path, 'r', newline='', encoding='utf-8') as csvfile:
+        reader = csv.reader(csvfile)
+        headers = next(reader)  # Get the headers
+        
+        # Find the indices of the origin and destination columns
+        try:
+            origin_idx = headers.index(origin_column)
+            dest_idx = headers.index(destination_column)
+        except ValueError:
+            raise ValueError(f"Column '{origin_column}' or '{destination_column}' not found in CSV")
+        
+        # Read all rows
+        for row in reader:
+            data.append(row)
     
-    if destination_column not in df.columns:
-        raise ValueError(f"Column '{destination_column}' not found in CSV")
+    print(f"Successfully loaded CSV with {len(data)} rows")
     
-    # Add unique ID to each row if not already present
-    if 'ID' not in df.columns:
-        df['ID'] = df.index + 1
-    
-    # Add new columns for latitude and longitude
-    df['Origin_Latitude'] = None
-    df['Origin_Longitude'] = None
-    df['Destination_Latitude'] = None
-    df['Destination_Longitude'] = None
+    # Prepare data structure for geocoding
+    geocoded_data = []
+    headers = headers + ['ID', 'Origin_Latitude', 'Origin_Longitude', 'Destination_Latitude', 'Destination_Longitude']
     
     # Create dictionaries to cache geocoded results to avoid duplicate API calls
     origin_cache = {}
     dest_cache = {}
     
-    # Sample code for testing with small datasets - remove for production
-    # Uncomment to test with fewer rows
-    # df = df.head(10)
-    
+    # Geocode addresses
     print("Starting geocoding process...")
-    for index, row in df.iterrows():
+    for i, row in enumerate(data):
         try:
+            # Create a new row with the original data
+            new_row = row.copy()
+            
+            # Add ID
+            new_row.append(str(i + 1))
+            
             # Geocode the origin address
-            origin_address = str(row[origin_column]).strip()
+            origin_address = str(row[origin_idx]).strip()
             if origin_address in origin_cache:
                 # Use cached result
                 origin_location = origin_cache[origin_address]
             else:
                 # Geocode and cache result
-                print(f"Geocoding origin ({index+1}/{len(df)}): {origin_address}")
+                print(f"Geocoding origin ({i+1}/{len(data)}): {origin_address}")
                 origin_location = get_lat_long(origin_address)
                 origin_cache[origin_address] = origin_location
             
+            # Add origin coordinates
             if origin_location is not None:
-                df.at[index, 'Origin_Latitude'] = origin_location[0]
-                df.at[index, 'Origin_Longitude'] = origin_location[1]
+                new_row.append(str(origin_location[0]))  # Latitude
+                new_row.append(str(origin_location[1]))  # Longitude
+            else:
+                new_row.append('')
+                new_row.append('')
             
             # Geocode the destination address
-            dest_address = str(row[destination_column]).strip()
+            dest_address = str(row[dest_idx]).strip()
             if dest_address in dest_cache:
                 # Use cached result
                 dest_location = dest_cache[dest_address]
             else:
                 # Geocode and cache result
-                print(f"Geocoding destination ({index+1}/{len(df)}): {dest_address}")
+                print(f"Geocoding destination ({i+1}/{len(data)}): {dest_address}")
                 dest_location = get_lat_long(dest_address)
                 dest_cache[dest_address] = dest_location
             
+            # Add destination coordinates
             if dest_location is not None:
-                df.at[index, 'Destination_Latitude'] = dest_location[0]
-                df.at[index, 'Destination_Longitude'] = dest_location[1]
+                new_row.append(str(dest_location[0]))  # Latitude
+                new_row.append(str(dest_location[1]))  # Longitude
+            else:
+                new_row.append('')
+                new_row.append('')
+            
+            geocoded_data.append(new_row)
             
             # Add a small delay to avoid hitting API limits
             time.sleep(0.2)
             
         except Exception as e:
-            print(f"Error processing row {index}: {e}")
+            print(f"Error processing row {i}: {e}")
     
     # Save the geocoded data
-    df.to_csv(geocoded_path, index=False)
+    with open(geocoded_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        writer.writerows(geocoded_data)
+    
     print(f"Saved geocoded data to {geocoded_path}")
     
-    # Remove rows with missing latitude or longitude values
-    complete_data = df.dropna(subset=['Origin_Latitude', 'Origin_Longitude', 'Destination_Latitude', 'Destination_Longitude'])
+    # Filter out rows with missing coordinates
+    complete_data = []
+    for row in geocoded_data:
+        # Check if all coordinate fields have values
+        id_idx = headers.index('ID')
+        origin_lat_idx = headers.index('Origin_Latitude')
+        origin_lon_idx = headers.index('Origin_Longitude')
+        dest_lat_idx = headers.index('Destination_Latitude')
+        dest_lon_idx = headers.index('Destination_Longitude')
+        
+        if (row[origin_lat_idx] and row[origin_lon_idx] and 
+            row[dest_lat_idx] and row[dest_lon_idx]):
+            complete_data.append(row)
+    
     print(f"Found {len(complete_data)} rows with complete geocoding")
     
     if len(complete_data) == 0:
@@ -202,36 +240,55 @@ def create_map(file_path, origin_column, destination_column, geocoded_path, map_
     origin_cluster = MarkerCluster(name="Origin Locations", show=True)
     dest_cluster = MarkerCluster(name="Destination Locations", show=True)
     
-    # Create a feature group for lines that can be toggled
+    # Create a feature group for lines that can be toggled (off by default)
     lines = folium.FeatureGroup(name="Routes", show=False)
     
     # Count frequency of each location
-    origin_counts = complete_data[origin_column].value_counts().to_dict()
-    dest_counts = complete_data[destination_column].value_counts().to_dict()
+    origin_counts = {}
+    dest_counts = {}
+    
+    for row in complete_data:
+        origin_address = row[origin_idx]
+        dest_address = row[dest_idx]
+        
+        if origin_address in origin_counts:
+            origin_counts[origin_address] += 1
+        else:
+            origin_counts[origin_address] = 1
+            
+        if dest_address in dest_counts:
+            dest_counts[dest_address] += 1
+        else:
+            dest_counts[dest_address] = 1
     
     # Store unique locations to prevent duplicates
     unique_origins = {}
     unique_dests = {}
     
     # Add markers for origin and destination locations
-    for index, row in complete_data.iterrows():
-        id_value = row['ID']
-        origin_address = str(row[origin_column])
-        dest_address = str(row[destination_column])
+    for row in complete_data:
+        id_value = row[headers.index('ID')]
+        origin_address = row[origin_idx]
+        dest_address = row[dest_idx]
         
         # Create popup content with frequency info
-        origin_count = origin_counts.get(row[origin_column], 0)
-        dest_count = dest_counts.get(row[destination_column], 0)
+        origin_count = origin_counts.get(origin_address, 0)
+        dest_count = dest_counts.get(dest_address, 0)
         
         origin_popup = f"<b>Origin:</b> {origin_address}<br><b>Frequency:</b> {origin_count} shipments"
         dest_popup = f"<b>Destination:</b> {dest_address}<br><b>Frequency:</b> {dest_count} shipments"
         
         # Get coordinates
-        origin_coords = (row['Origin_Latitude'], row['Origin_Longitude'])
-        dest_coords = (row['Destination_Latitude'], row['Destination_Longitude'])
+        origin_lat = float(row[headers.index('Origin_Latitude')])
+        origin_lon = float(row[headers.index('Origin_Longitude')])
+        dest_lat = float(row[headers.index('Destination_Latitude')])
+        dest_lon = float(row[headers.index('Destination_Longitude')])
+        
+        origin_coords = (origin_lat, origin_lon)
+        dest_coords = (dest_lat, dest_lon)
         
         # Origin marker - check for duplicates
-        origin_key = f"{origin_coords[0]:.6f},{origin_coords[1]:.6f}"
+        origin_key = f"{origin_lat:.6f},{origin_lon:.6f}"
         if origin_key not in unique_origins:
             origin_marker = folium.Marker(
                 location=origin_coords,
@@ -243,7 +300,7 @@ def create_map(file_path, origin_column, destination_column, geocoded_path, map_
             unique_origins[origin_key] = True
         
         # Destination marker - check for duplicates
-        dest_key = f"{dest_coords[0]:.6f},{dest_coords[1]:.6f}"
+        dest_key = f"{dest_lat:.6f},{dest_lon:.6f}"
         if dest_key not in unique_dests:
             dest_marker = folium.Marker(
                 location=dest_coords,

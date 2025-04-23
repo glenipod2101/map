@@ -8,6 +8,12 @@ from folium.plugins import MarkerCluster
 import os
 import uuid
 
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAP_FOLDER'] = 'maps'
@@ -19,7 +25,7 @@ os.makedirs(app.config['MAP_FOLDER'], exist_ok=True)
 os.makedirs(app.config['GEOCODED_FOLDER'], exist_ok=True)
 
 # Your Google Maps API key
-GM_API_KEY = 'AIzaSyDk6QAxrCRJ3M9vGUVoSOZFZopu9HRi6eQ'
+GM_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY')
 
 @app.route('/')
 def index():

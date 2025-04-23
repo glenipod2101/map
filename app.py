@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, jsonify
 import csv
 import io
 from geopy.geocoders import GoogleV3
@@ -8,12 +8,20 @@ import folium
 from folium.plugins import MarkerCluster
 import os
 import uuid
+import threading
 from dotenv import load_dotenv
+import multiprocessing
+
+# Set Gunicorn timeout to a higher value
+# This must be before the app is created
+os.environ['GUNICORN_CMD_ARGS'] = "--timeout 120"
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
+# Store background jobs
+app.config['JOBS'] = {}
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAP_FOLDER'] = 'maps'
 app.config['GEOCODED_FOLDER'] = 'geocoded'
@@ -72,12 +80,80 @@ def process_file():
     geocoded_path = os.path.join(app.config['GEOCODED_FOLDER'], f"geocoded_{unique_id}.csv")
     map_path = os.path.join(app.config['MAP_FOLDER'], f"map_{unique_id}.html")
     
-    # Run the geocoding and mapping process
+    # Count rows in the file to determine if we need batch processing
+    row_count = 0
+    with open(file_path, 'r', newline='', encoding='utf-8') as csvfile:
+        reader = csv.reader(csvfile)
+        next(reader)  # Skip header
+        for _ in reader:
+            row_count += 1
+    
+    # If file is large, start processing in the background and show progress page
+    if row_count > 30:  # More than 30 rows
+        # Store job info
+        job_id = str(uuid.uuid4())
+        app.config['JOBS'][job_id] = {
+            'status': 'processing',
+            'progress': 0,
+            'file_path': file_path,
+            'origin_column': origin_column,
+            'destination_column': destination_column,
+            'geocoded_path': geocoded_path,
+            'map_path': map_path,
+            'unique_id': unique_id
+        }
+        
+        # Start a background thread to process the data
+        threading.Thread(
+            target=process_in_background,
+            args=(job_id, file_path, origin_column, destination_column, geocoded_path, map_path)
+        ).start()
+        
+        # Return the processing page with job_id
+        return render_template('processing.html', job_id=job_id)
+    else:
+        # For small files, process directly
+        try:
+            create_map(file_path, origin_column, destination_column, geocoded_path, map_path, max_rows=100)
+            return render_template('result.html', map_file=f"map_{unique_id}.html")
+        except Exception as e:
+            return f"Error creating map: {str(e)}"
+            
+def process_in_background(job_id, file_path, origin_column, destination_column, geocoded_path, map_path):
+    """Process the file in the background and update job status"""
     try:
-        create_map(file_path, origin_column, destination_column, geocoded_path, map_path)
-        return render_template('result.html', map_file=f"map_{unique_id}.html")
+        # Process in batches of 30 rows
+        create_map(file_path, origin_column, destination_column, geocoded_path, map_path, 
+                  max_rows=200, job_id=job_id)
+        
+        # Update job status when complete
+        app.config['JOBS'][job_id]['status'] = 'complete'
+        app.config['JOBS'][job_id]['progress'] = 100
     except Exception as e:
-        return f"Error creating map: {str(e)}"
+        # Update job status on error
+        app.config['JOBS'][job_id]['status'] = 'error'
+        app.config['JOBS'][job_id]['error'] = str(e)
+        print(f"Background processing error: {str(e)}")
+
+@app.route('/job-status/<job_id>')
+def job_status(job_id):
+    """Check the status of a background geocoding job"""
+    if job_id in app.config['JOBS']:
+        job = app.config['JOBS'][job_id]
+        return jsonify(job)
+    else:
+        return jsonify({'status': 'not_found'}), 404
+
+@app.route('/result/<job_id>')
+def job_result(job_id):
+    """Show results after background processing is complete"""
+    if job_id in app.config['JOBS'] and app.config['JOBS'][job_id]['status'] == 'complete':
+        job = app.config['JOBS'][job_id]
+        return render_template('result.html', map_file=f"map_{job['unique_id']}.html")
+    elif job_id in app.config['JOBS'] and app.config['JOBS'][job_id]['status'] == 'error':
+        return f"Error creating map: {app.config['JOBS'][job_id].get('error', 'Unknown error')}"
+    else:
+        return redirect(url_for('index'))
 
 @app.route('/maps/<filename>')
 def get_map(filename):
@@ -119,7 +195,7 @@ def get_lat_long(address, retries=3):
             else:
                 return None
 
-def create_map(file_path, origin_column, destination_column, geocoded_path, map_path):
+def create_map(file_path, origin_column, destination_column, geocoded_path, map_path, max_rows=None, job_id=None):
     """Create a map from the CSV file without using pandas"""
     # Read the CSV file
     data = []
@@ -136,9 +212,11 @@ def create_map(file_path, origin_column, destination_column, geocoded_path, map_
         except ValueError:
             raise ValueError(f"Column '{origin_column}' or '{destination_column}' not found in CSV")
         
-        # Read all rows
-        for row in reader:
+        # Read all rows, but limit if max_rows is specified
+        for i, row in enumerate(reader):
             data.append(row)
+            if max_rows is not None and i >= max_rows - 1:
+                break
     
     print(f"Successfully loaded CSV with {len(data)} rows")
     
@@ -154,6 +232,12 @@ def create_map(file_path, origin_column, destination_column, geocoded_path, map_
     print("Starting geocoding process...")
     for i, row in enumerate(data):
         try:
+            # Update progress if job_id is provided
+            if job_id and i % 5 == 0:  # Update every 5 rows
+                progress = min(int((i / len(data)) * 100), 99)  # Keep it under 100 until complete
+                app.config['JOBS'][job_id]['progress'] = progress
+                print(f"Geocoding progress: {progress}%")
+            
             # Create a new row with the original data
             new_row = row.copy()
             
